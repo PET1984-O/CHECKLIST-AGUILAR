@@ -12,6 +12,11 @@ import re
 import streamlit as st
 import streamlit.components.v1 as components
 
+try:
+    from pdf_assets import ORIGINAL_CHECKLIST_PDFS
+except ImportError:
+    ORIGINAL_CHECKLIST_PDFS = {}
+
 
 st.set_page_config(
     page_title="Checklist Aguilar 2025",
@@ -517,6 +522,10 @@ def upload_key(prefix: str, section: str, item: str) -> str:
     return item_key(prefix, section, item).replace("ck_", "up_", 1)
 
 
+def client_pending_key(prefix: str, section: str, item: str) -> str:
+    return item_key(prefix, section, item).replace("ck_", "pc_", 1)
+
+
 def optional_key(tipo: str, section: str) -> str:
     return "op_" + re.sub(r"[^A-Za-z0-9_]+", "_", f"{tipo}|{section}")[:180]
 
@@ -617,10 +626,19 @@ def make_csv(rows: List[Dict[str, str]]) -> str:
     return output.getvalue()
 
 
+def selected_pending_rows(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> List[Dict[str, str]]:
+    return [
+        row
+        for row in rows
+        if row["estado"] != "Recibido"
+        and st.session_state.get(client_pending_key(expediente["folio"], row["seccion"], row["requisito"]), False)
+    ]
+
+
 def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
-    pending = [row for row in rows if row["estado"] != "Recibido"]
+    pending = selected_pending_rows(rows, expediente)
     lines = [
-        "REQUISITOS FALTANTES - CHECKLIST AGUILAR 2025",
+        "REQUISITOS FALTANTES PARA CLIENTE - CHECKLIST AGUILAR 2025",
         f"Folio: {expediente['folio']}",
         f"Cliente: {expediente['cliente']}",
         f"Estado civil: {expediente.get('estado_civil', '')}",
@@ -628,7 +646,7 @@ def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> 
         "",
     ]
     if not pending:
-        lines.append("No hay requisitos faltantes.")
+        lines.append("No hay requisitos seleccionados para enviar al cliente.")
         return "\n".join(lines)
 
     current_section = None
@@ -657,6 +675,9 @@ def make_progress_json(
                     "item": item,
                     "done": st.session_state.get(item_key(expediente["folio"], section.name, item), False),
                     "comment": st.session_state.get(comment_key(expediente["folio"], section.name, item), ""),
+                    "send_to_client": st.session_state.get(
+                        client_pending_key(expediente["folio"], section.name, item), False
+                    ),
                     "files": [
                         file.name
                         for file in st.session_state.get(upload_key(expediente["folio"], section.name, item), [])
@@ -701,6 +722,9 @@ def restore_progress(payload: Dict[str, object], tipo: str, expediente: Dict[str
         item = str(saved.get("item", ""))
         st.session_state[item_key(expediente["folio"], section, item)] = bool(saved.get("done", False))
         st.session_state[comment_key(expediente["folio"], section, item)] = str(saved.get("comment", ""))
+        st.session_state[client_pending_key(expediente["folio"], section, item)] = bool(
+            saved.get("send_to_client", False)
+        )
 
     return True, "Avance restaurado correctamente."
 
@@ -792,6 +816,26 @@ def restore_saved_client(payload: Dict[str, object]) -> tuple[bool, str]:
     return True, "Expediente cargado correctamente."
 
 
+def render_original_checklist_downloads() -> None:
+    with st.container(border=True):
+        st.subheader("Formatos originales para descarga")
+        if not ORIGINAL_CHECKLIST_PDFS:
+            st.info("Los formatos originales todavía no están disponibles en esta versión.")
+            return
+
+        cols = st.columns(3)
+        for index, (filename, pdf_bytes) in enumerate(ORIGINAL_CHECKLIST_PDFS.items()):
+            label = filename.replace(".pdf", "")
+            with cols[index % 3]:
+                st.download_button(
+                    label,
+                    data=pdf_bytes,
+                    file_name=filename,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+
+
 def render_start_page() -> None:
     data = get_client_data()
     with st.container(border=True):
@@ -863,6 +907,8 @@ def render_start_page() -> None:
                     st.warning(message)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 st.error("No pude leer ese archivo de avance.")
+
+    render_original_checklist_downloads()
 
 
 def render_client_file(expediente: Dict[str, str], tipo: str, complete: int, total: int, ratio: float) -> None:
@@ -949,7 +995,7 @@ def render_sidebar(
         use_container_width=True,
     )
     st.sidebar.download_button(
-        "Descargar faltantes (.txt)",
+        "Descargar faltantes cliente (.txt)",
         data=make_pending_txt(rows, expediente),
         file_name=f"{filename_base}_faltantes.txt",
         mime="text/plain",
@@ -989,15 +1035,18 @@ def render_sidebar(
         st.rerun()
 
 
-def render_pending_summary(rows: List[Dict[str, str]]) -> None:
+def render_pending_summary(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> None:
     pending = [row for row in rows if row["estado"] != "Recibido"]
+    selected = selected_pending_rows(rows, expediente)
     with st.container(border=True):
-        st.subheader("Requisitos faltantes")
+        st.subheader("Requisitos faltantes para enviar al cliente")
         if not pending:
             st.success("Expediente completo. No hay requisitos faltantes.")
             return
 
-        st.caption(f"Pendientes: {len(pending)}")
+        st.caption(
+            f"Pendientes del expediente: {len(pending)} · Seleccionados para cliente: {len(selected)}"
+        )
         grouped: Dict[str, List[Dict[str, str]]] = {}
         for row in pending:
             grouped.setdefault(row["seccion"], []).append(row)
@@ -1005,8 +1054,20 @@ def render_pending_summary(rows: List[Dict[str, str]]) -> None:
         for section, items in grouped.items():
             st.markdown(f"**{section}**")
             for row in items:
-                comment = f" _({row['comentario']})_" if row["comentario"] else ""
-                st.markdown(f"- {row['requisito']}{comment}")
+                comment = f" ({row['comentario']})" if row["comentario"] else ""
+                st.checkbox(
+                    f"{row['requisito']}{comment}",
+                    key=client_pending_key(expediente["folio"], row["seccion"], row["requisito"]),
+                )
+
+        filename_base = f"Faltantes_cliente_{clean_filename(expediente['cliente'])}"
+        st.download_button(
+            "Descargar listado seleccionado para cliente (.txt)",
+            data=make_pending_txt(rows, expediente),
+            file_name=f"{filename_base}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
 
 def render_checklist(tipo: str, sections: List[Section], query: str, expediente: Dict[str, str]) -> None:
@@ -1077,8 +1138,8 @@ def main() -> None:
 
     render_client_file(expediente, tipo, complete, total, ratio)
     render_sidebar(tipo, sections, rows, expediente, enabled_optional)
-    render_pending_summary(rows)
     render_checklist(tipo, sections, query or "", expediente)
+    render_pending_summary(rows, expediente)
 
     st.divider()
     st.caption(
