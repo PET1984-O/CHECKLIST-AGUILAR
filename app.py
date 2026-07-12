@@ -5,9 +5,12 @@ from datetime import date
 from io import StringIO
 from typing import Dict, Iterable, List
 import csv
+import hashlib
+import json
 import re
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 st.set_page_config(
@@ -510,6 +513,10 @@ def comment_key(prefix: str, section: str, item: str) -> str:
     return item_key(prefix, section, item).replace("ck_", "cm_", 1)
 
 
+def optional_key(tipo: str, section: str) -> str:
+    return "op_" + re.sub(r"[^A-Za-z0-9_]+", "_", f"{tipo}|{section}")[:180]
+
+
 def visible_sections(tipo: str, enabled_optional: Iterable[str]) -> List[Section]:
     selected = set(enabled_optional)
     return [
@@ -588,6 +595,88 @@ def make_csv(rows: List[Dict[str, str]]) -> str:
     return output.getvalue()
 
 
+def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
+    pending = [row for row in rows if row["estado"] != "Recibido"]
+    lines = [
+        "REQUISITOS FALTANTES - CHECKLIST AGUILAR 2025",
+        f"Folio: {expediente['folio']}",
+        f"Cliente: {expediente['cliente']}",
+        f"Fecha: {expediente['fecha']}",
+        "",
+    ]
+    if not pending:
+        lines.append("No hay requisitos faltantes.")
+        return "\n".join(lines)
+
+    current_section = None
+    for row in pending:
+        if row["seccion"] != current_section:
+            current_section = row["seccion"]
+            lines.extend(["", f"--- {current_section.upper()} ---"])
+        comment = f" | Comentario: {row['comentario']}" if row["comentario"] else ""
+        lines.append(f"- {row['requisito']}{comment}")
+    return "\n".join(lines)
+
+
+def make_progress_json(
+    tipo: str,
+    sections: List[Section],
+    expediente: Dict[str, str],
+    enabled_optional: Iterable[str],
+) -> str:
+    saved_items = []
+    for section in sections:
+        for item in section.items:
+            saved_items.append(
+                {
+                    "section": section.name,
+                    "item": item,
+                    "done": st.session_state.get(item_key(expediente["folio"], section.name, item), False),
+                    "comment": st.session_state.get(comment_key(expediente["folio"], section.name, item), ""),
+                }
+            )
+
+    payload = {
+        "version": 1,
+        "tipo_credito": tipo,
+        "expediente": expediente,
+        "optional_sections": list(enabled_optional),
+        "items": saved_items,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def restore_progress(payload: Dict[str, object], tipo: str, expediente: Dict[str, str]) -> tuple[bool, str]:
+    saved_tipo = str(payload.get("tipo_credito", ""))
+    if saved_tipo and saved_tipo != tipo:
+        return False, f"El archivo pertenece a '{saved_tipo}'. Seleccione ese tipo de expediente antes de cargarlo."
+
+    saved_expediente = payload.get("expediente", {})
+    if isinstance(saved_expediente, dict):
+        saved_folio = str(saved_expediente.get("folio", ""))
+        if saved_folio and saved_folio != expediente["folio"]:
+            return False, f"El archivo pertenece al folio '{saved_folio}'. Use ese folio para restaurar el avance."
+
+    optional_sections = payload.get("optional_sections", [])
+    if isinstance(optional_sections, list):
+        for section_name in optional_sections:
+            st.session_state[optional_key(tipo, str(section_name))] = True
+
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        return False, "El archivo de avance no tiene el formato esperado."
+
+    for saved in items:
+        if not isinstance(saved, dict):
+            continue
+        section = str(saved.get("section", ""))
+        item = str(saved.get("item", ""))
+        st.session_state[item_key(expediente["folio"], section, item)] = bool(saved.get("done", False))
+        st.session_state[comment_key(expediente["folio"], section, item)] = str(saved.get("comment", ""))
+
+    return True, "Avance restaurado correctamente."
+
+
 def progress(rows: List[Dict[str, str]]) -> tuple[int, int, float]:
     total = len(rows)
     complete = sum(1 for row in rows if row["estado"] == "Recibido")
@@ -600,7 +689,32 @@ def render_header() -> None:
     st.caption("Control digital de expedientes para Ventas y Titulación")
 
 
-def render_sidebar(tipo: str, sections: List[Section], rows: List[Dict[str, str]], expediente: Dict[str, str]) -> None:
+def render_print_button() -> None:
+    components.html(
+        """
+        <button onclick="window.parent.print()" style="
+            width:100%;
+            border:1px solid #0F766E;
+            border-radius:6px;
+            background:#0F766E;
+            color:white;
+            padding:0.55rem 0.8rem;
+            font:600 0.95rem sans-serif;
+            cursor:pointer;">
+            Imprimir checklist
+        </button>
+        """,
+        height=48,
+    )
+
+
+def render_sidebar(
+    tipo: str,
+    sections: List[Section],
+    rows: List[Dict[str, str]],
+    expediente: Dict[str, str],
+    enabled_optional: Iterable[str],
+) -> None:
     complete, total, ratio = progress(rows)
     st.sidebar.header("Resumen")
     st.sidebar.metric("Avance", f"{complete}/{total}", f"{ratio:.0%}")
@@ -623,6 +737,44 @@ def render_sidebar(tipo: str, sections: List[Section], rows: List[Dict[str, str]
         mime="text/csv",
         use_container_width=True,
     )
+    st.sidebar.download_button(
+        "Guardar avance (.json)",
+        data=make_progress_json(tipo, sections, expediente, enabled_optional),
+        file_name=f"{filename_base}_avance.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    st.sidebar.download_button(
+        "Descargar faltantes (.txt)",
+        data=make_pending_txt(rows, expediente),
+        file_name=f"{filename_base}_faltantes.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+
+    st.sidebar.header("Imprimir")
+    render_print_button()
+
+    st.sidebar.header("Restaurar")
+    uploaded = st.sidebar.file_uploader("Cargar avance guardado", type=["json"])
+    if uploaded is not None:
+        uploaded_bytes = uploaded.getvalue()
+        upload_hash = hashlib.sha256(uploaded_bytes).hexdigest()
+        if st.session_state.get("last_restored_upload") == upload_hash:
+            st.sidebar.info("Este avance ya fue cargado.")
+            return
+
+        try:
+            payload = json.loads(uploaded_bytes.decode("utf-8"))
+            restored, message = restore_progress(payload, tipo, expediente)
+            if restored:
+                st.session_state["last_restored_upload"] = upload_hash
+                st.sidebar.success(message)
+                st.rerun()
+            else:
+                st.sidebar.warning(message)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            st.sidebar.error("No pude leer ese archivo de avance.")
 
     st.sidebar.header("Captura")
     if st.sidebar.button("Limpiar marcas de este expediente", use_container_width=True):
@@ -631,6 +783,26 @@ def render_sidebar(tipo: str, sections: List[Section], rows: List[Dict[str, str]
                 st.session_state[item_key(expediente["folio"], section.name, item)] = False
                 st.session_state[comment_key(expediente["folio"], section.name, item)] = ""
         st.rerun()
+
+
+def render_pending_summary(rows: List[Dict[str, str]]) -> None:
+    pending = [row for row in rows if row["estado"] != "Recibido"]
+    with st.container(border=True):
+        st.subheader("Requisitos faltantes")
+        if not pending:
+            st.success("Expediente completo. No hay requisitos faltantes.")
+            return
+
+        st.caption(f"Pendientes: {len(pending)}")
+        grouped: Dict[str, List[Dict[str, str]]] = {}
+        for row in pending:
+            grouped.setdefault(row["seccion"], []).append(row)
+
+        for section, items in grouped.items():
+            st.markdown(f"**{section}**")
+            for row in items:
+                comment = f" _({row['comentario']})_" if row["comentario"] else ""
+                st.markdown(f"- {row['requisito']}{comment}")
 
 
 def render_checklist(tipo: str, sections: List[Section], query: str, expediente: Dict[str, str]) -> None:
@@ -691,7 +863,7 @@ def main() -> None:
         cols = st.columns(min(3, len(optional_sections)))
         for index, section in enumerate(optional_sections):
             with cols[index % len(cols)]:
-                if st.toggle(section.name, help=section.help_text):
+                if st.toggle(section.name, help=section.help_text, key=optional_key(tipo, section.name)):
                     enabled_optional.append(section.name)
 
     sections = visible_sections(tipo, enabled_optional)
@@ -715,7 +887,8 @@ def main() -> None:
     with stat_col:
         st.metric("Avance del expediente", f"{ratio:.0%}", f"{complete} de {total}")
 
-    render_sidebar(tipo, sections, rows, expediente)
+    render_sidebar(tipo, sections, rows, expediente, enabled_optional)
+    render_pending_summary(rows)
     render_checklist(tipo, sections, query or "", expediente)
 
     st.divider()
