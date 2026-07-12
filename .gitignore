@@ -1,0 +1,5 @@
+.venv/
+.npm-cache/
+.pycache/
+__pycache__/
+.DS_Store
