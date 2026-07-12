@@ -513,8 +513,25 @@ def comment_key(prefix: str, section: str, item: str) -> str:
     return item_key(prefix, section, item).replace("ck_", "cm_", 1)
 
 
+def upload_key(prefix: str, section: str, item: str) -> str:
+    return item_key(prefix, section, item).replace("ck_", "up_", 1)
+
+
 def optional_key(tipo: str, section: str) -> str:
     return "op_" + re.sub(r"[^A-Za-z0-9_]+", "_", f"{tipo}|{section}")[:180]
+
+
+def get_marital_optional_sections(tipo: str, estado_civil: str) -> List[str]:
+    if estado_civil != "Casado":
+        return []
+
+    markers = ("casado", "conyugal", "cónyuge", "mancomunado", "coacreditado", "sociedad conyugal")
+    return [
+        section.name
+        for section in CHECKLISTS[tipo]
+        if section.optional
+        and any(marker in f"{section.name} {section.help_text}".lower() for marker in markers)
+    ]
 
 
 def visible_sections(tipo: str, enabled_optional: Iterable[str]) -> List[Section]:
@@ -533,6 +550,8 @@ def collect_rows(tipo: str, sections: List[Section], expediente: Dict[str, str])
         for item in section.items:
             done = st.session_state.get(item_key(prefix, section.name, item), False)
             comment = st.session_state.get(comment_key(prefix, section.name, item), "")
+            uploaded_files = st.session_state.get(upload_key(prefix, section.name, item), [])
+            uploaded_names = ", ".join(file.name for file in uploaded_files) if uploaded_files else ""
             rows.append(
                 {
                     "folio": expediente["folio"],
@@ -548,6 +567,7 @@ def collect_rows(tipo: str, sections: List[Section], expediente: Dict[str, str])
                     "requisito": item,
                     "estado": "Recibido" if done else "Pendiente",
                     "comentario": comment,
+                    "archivos": uploaded_names,
                 }
             )
     return rows
@@ -560,6 +580,7 @@ def make_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
         f"Fecha: {expediente['fecha']}",
         f"Tipo de crédito: {rows[0]['tipo_credito'] if rows else ''}",
         f"Cliente: {expediente['cliente']}",
+        f"Estado civil: {expediente.get('estado_civil', '')}",
         f"Teléfono: {expediente['telefono']}",
         f"Asesor: {expediente['asesor']}",
         f"Desarrollo: {expediente['desarrollo']}",
@@ -574,7 +595,8 @@ def make_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
             lines.extend(["", f"--- {current_section.upper()} ---"])
         mark = "X" if row["estado"] == "Recibido" else " "
         comment = f" | Comentario: {row['comentario']}" if row["comentario"] else ""
-        lines.append(f"[{mark}] {row['requisito']}{comment}")
+        files = f" | Archivos: {row['archivos']}" if row.get("archivos") else ""
+        lines.append(f"[{mark}] {row['requisito']}{comment}{files}")
     lines.extend(
         [
             "",
@@ -601,6 +623,7 @@ def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> 
         "REQUISITOS FALTANTES - CHECKLIST AGUILAR 2025",
         f"Folio: {expediente['folio']}",
         f"Cliente: {expediente['cliente']}",
+        f"Estado civil: {expediente.get('estado_civil', '')}",
         f"Fecha: {expediente['fecha']}",
         "",
     ]
@@ -614,7 +637,8 @@ def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> 
             current_section = row["seccion"]
             lines.extend(["", f"--- {current_section.upper()} ---"])
         comment = f" | Comentario: {row['comentario']}" if row["comentario"] else ""
-        lines.append(f"- {row['requisito']}{comment}")
+        files = f" | Archivos: {row['archivos']}" if row.get("archivos") else ""
+        lines.append(f"- {row['requisito']}{comment}{files}")
     return "\n".join(lines)
 
 
@@ -633,6 +657,10 @@ def make_progress_json(
                     "item": item,
                     "done": st.session_state.get(item_key(expediente["folio"], section.name, item), False),
                     "comment": st.session_state.get(comment_key(expediente["folio"], section.name, item), ""),
+                    "files": [
+                        file.name
+                        for file in st.session_state.get(upload_key(expediente["folio"], section.name, item), [])
+                    ],
                 }
             )
 
@@ -687,6 +715,182 @@ def progress(rows: List[Dict[str, str]]) -> tuple[int, int, float]:
 def render_header() -> None:
     st.title("Checklist Aguilar 2025")
     st.caption("Control digital de expedientes para Ventas y Titulación")
+
+
+def default_client_data() -> Dict[str, str]:
+    return {
+        "tipo_credito": "Infonavit Tradicional y Total",
+        "folio": f"AG-{date.today():%Y%m%d}",
+        "fecha": date.today().isoformat(),
+        "cliente": "",
+        "telefono": "",
+        "asesor": "",
+        "desarrollo": "",
+        "calle": "",
+        "ubicacion": "",
+        "estado_civil": "Soltero",
+        "observaciones": "",
+    }
+
+
+def get_client_data() -> Dict[str, str]:
+    if "client_data" not in st.session_state:
+        st.session_state["client_data"] = default_client_data()
+    return st.session_state["client_data"]
+
+
+def client_data_from_payload(payload: Dict[str, object]) -> Dict[str, str]:
+    saved_expediente = payload.get("expediente", {})
+    if not isinstance(saved_expediente, dict):
+        saved_expediente = {}
+
+    data = default_client_data()
+    data.update(
+        {
+            "tipo_credito": str(payload.get("tipo_credito") or data["tipo_credito"]),
+            "folio": str(saved_expediente.get("folio") or data["folio"]),
+            "fecha": str(saved_expediente.get("fecha") or data["fecha"]),
+            "cliente": str(saved_expediente.get("cliente") or ""),
+            "telefono": str(saved_expediente.get("telefono") or ""),
+            "asesor": str(saved_expediente.get("asesor") or ""),
+            "desarrollo": str(saved_expediente.get("desarrollo") or ""),
+            "calle": str(saved_expediente.get("calle") or ""),
+            "ubicacion": str(saved_expediente.get("ubicacion") or ""),
+            "estado_civil": str(saved_expediente.get("estado_civil") or "Soltero"),
+            "observaciones": str(saved_expediente.get("observaciones") or ""),
+        }
+    )
+    if data["tipo_credito"] not in CHECKLISTS:
+        data["tipo_credito"] = "Infonavit Tradicional y Total"
+    if data["estado_civil"] not in ("Soltero", "Casado"):
+        data["estado_civil"] = "Soltero"
+    return data
+
+
+def restore_saved_client(payload: Dict[str, object]) -> tuple[bool, str]:
+    data = client_data_from_payload(payload)
+    enabled_optional = get_marital_optional_sections(data["tipo_credito"], data["estado_civil"])
+    expediente = {
+        "folio": data["folio"],
+        "fecha": data["fecha"],
+        "cliente": data["cliente"],
+        "telefono": data["telefono"],
+        "asesor": data["asesor"],
+        "desarrollo": data["desarrollo"],
+        "calle": data["calle"],
+        "ubicacion": data["ubicacion"],
+        "estado_civil": data["estado_civil"],
+        "observaciones": data["observaciones"],
+    }
+    restored, message = restore_progress(payload, data["tipo_credito"], expediente)
+    if not restored:
+        return False, message
+
+    st.session_state["client_data"] = data
+    st.session_state["client_registered"] = True
+    st.session_state["restored_optional_sections"] = enabled_optional
+    return True, "Expediente cargado correctamente."
+
+
+def render_start_page() -> None:
+    data = get_client_data()
+    with st.container(border=True):
+        st.subheader("Registro del cliente")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tipo = st.selectbox(
+                "Tipo de crédito",
+                list(CHECKLISTS.keys()),
+                index=list(CHECKLISTS.keys()).index(data.get("tipo_credito", "Infonavit Tradicional y Total")),
+            )
+            cliente = st.text_input("Nombre del cliente", value=data.get("cliente", ""))
+            asesor = st.text_input("Asesor", value=data.get("asesor", ""))
+        with c2:
+            folio = st.text_input("Folio interno", value=data.get("folio", f"AG-{date.today():%Y%m%d}"))
+            desarrollo = st.text_input("Desarrollo / fraccionamiento", value=data.get("desarrollo", ""))
+            calle = st.text_input("Calle y número", value=data.get("calle", ""))
+        with c3:
+            fecha_value = date.fromisoformat(data.get("fecha", date.today().isoformat()))
+            fecha = st.date_input("Fecha de entrega", value=fecha_value).isoformat()
+            ubicacion = st.text_input("Ubicación / manzana y lote", value=data.get("ubicacion", ""))
+            telefono = st.text_input("Teléfono", value=data.get("telefono", ""))
+
+        estado_civil = st.segmented_control(
+            "Estado civil",
+            ["Soltero", "Casado"],
+            default=data.get("estado_civil", "Soltero"),
+        )
+        observaciones = st.text_area("Observaciones generales", value=data.get("observaciones", ""), height=90)
+
+        if st.button("Registrar cliente y abrir checklist", type="primary", use_container_width=True):
+            if not cliente.strip():
+                st.warning("Capture el nombre del cliente.")
+                return
+            if not asesor.strip():
+                st.warning("Capture el asesor.")
+                return
+            if not desarrollo.strip():
+                st.warning("Capture el desarrollo.")
+                return
+
+            st.session_state["client_data"] = {
+                "tipo_credito": tipo,
+                "folio": folio or f"AG-{date.today():%Y%m%d}",
+                "fecha": fecha,
+                "cliente": cliente,
+                "telefono": telefono,
+                "asesor": asesor,
+                "desarrollo": desarrollo,
+                "calle": calle,
+                "ubicacion": ubicacion,
+                "estado_civil": estado_civil or "Soltero",
+                "observaciones": observaciones,
+            }
+            st.session_state["client_registered"] = True
+            st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Abrir avance guardado")
+        uploaded = st.file_uploader("Cargar expediente guardado (.json)", type=["json"])
+        if uploaded is not None:
+            try:
+                payload = json.loads(uploaded.getvalue().decode("utf-8"))
+                restored, message = restore_saved_client(payload)
+                if restored:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.warning(message)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                st.error("No pude leer ese archivo de avance.")
+
+
+def render_client_file(expediente: Dict[str, str], tipo: str, complete: int, total: int, ratio: float) -> None:
+    with st.container(border=True):
+        top_left, top_right = st.columns([0.72, 0.28])
+        with top_left:
+            st.subheader(expediente["cliente"] or "Cliente sin nombre")
+            st.caption(f"{tipo} · {expediente['estado_civil']} · Folio {expediente['folio']}")
+        with top_right:
+            st.metric("Avance", f"{ratio:.0%}", f"{complete} de {total}")
+            st.progress(ratio)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(f"**Asesor**  \n{expediente['asesor'] or '-'}")
+        c2.markdown(f"**Desarrollo**  \n{expediente['desarrollo'] or '-'}")
+        c3.markdown(f"**Ubicación**  \n{expediente['ubicacion'] or '-'}")
+        c4.markdown(f"**Fecha**  \n{expediente['fecha'] or '-'}")
+
+        c5, c6 = st.columns(2)
+        c5.markdown(f"**Calle**  \n{expediente['calle'] or '-'}")
+        c6.markdown(f"**Teléfono**  \n{expediente['telefono'] or '-'}")
+
+        if expediente.get("observaciones"):
+            st.markdown(f"**Observaciones**  \n{expediente['observaciones']}")
+
+        if st.button("Editar registro del cliente", use_container_width=True):
+            st.session_state["client_registered"] = False
+            st.rerun()
 
 
 def render_print_button() -> None:
@@ -822,61 +1026,45 @@ def render_checklist(tipo: str, sections: List[Section], query: str, expediente:
             if section.help_text:
                 st.info(section.help_text)
             for item in filtered:
-                left, right = st.columns([0.58, 0.42])
+                left, middle, right = st.columns([0.46, 0.28, 0.26])
                 key = item_key(expediente["folio"], section.name, item)
                 ckey = comment_key(expediente["folio"], section.name, item)
+                ukey = upload_key(expediente["folio"], section.name, item)
                 with left:
                     st.checkbox(item, key=key)
-                with right:
+                with middle:
                     st.text_input("Comentario", key=ckey, label_visibility="collapsed", placeholder="Comentario o faltante")
+                with right:
+                    st.file_uploader(
+                        "Archivo",
+                        key=ukey,
+                        label_visibility="collapsed",
+                        accept_multiple_files=True,
+                    )
 
 
 def main() -> None:
     render_header()
 
-    with st.container(border=True):
-        left, middle, right = st.columns([1.2, 1, 1])
-        with left:
-            tipo = st.selectbox("Tipo de expediente", list(CHECKLISTS.keys()))
-        with middle:
-            folio = st.text_input("Folio interno", value=f"AG-{date.today():%Y%m%d}")
-        with right:
-            fecha = st.date_input("Fecha de entrega", value=date.today()).isoformat()
+    if not st.session_state.get("client_registered", False):
+        render_start_page()
+        return
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            cliente = st.text_input("Nombre del cliente", placeholder="Ej. Juan Pérez López")
-            telefono = st.text_input("Teléfono", placeholder="Opcional")
-        with c2:
-            asesor = st.text_input("Asesor", placeholder="Nombre del asesor")
-            desarrollo = st.text_input("Desarrollo / fraccionamiento")
-        with c3:
-            calle = st.text_input("Calle y número")
-            ubicacion = st.text_input("Ubicación / manzana y lote")
-
-        observaciones = st.text_area("Observaciones generales", height=90)
-
-    optional_sections = [section for section in CHECKLISTS[tipo] if section.optional]
-    enabled_optional = []
-    if optional_sections:
-        st.subheader("Casos especiales")
-        cols = st.columns(min(3, len(optional_sections)))
-        for index, section in enumerate(optional_sections):
-            with cols[index % len(cols)]:
-                if st.toggle(section.name, help=section.help_text, key=optional_key(tipo, section.name)):
-                    enabled_optional.append(section.name)
-
+    data = get_client_data()
+    tipo = data["tipo_credito"]
+    enabled_optional = get_marital_optional_sections(tipo, data.get("estado_civil", "Soltero"))
     sections = visible_sections(tipo, enabled_optional)
     expediente = {
-        "folio": folio or "SIN-FOLIO",
-        "fecha": fecha,
-        "cliente": cliente,
-        "telefono": telefono,
-        "asesor": asesor,
-        "desarrollo": desarrollo,
-        "calle": calle,
-        "ubicacion": ubicacion,
-        "observaciones": observaciones,
+        "folio": data.get("folio") or "SIN-FOLIO",
+        "fecha": data.get("fecha", ""),
+        "cliente": data.get("cliente", ""),
+        "telefono": data.get("telefono", ""),
+        "asesor": data.get("asesor", ""),
+        "desarrollo": data.get("desarrollo", ""),
+        "calle": data.get("calle", ""),
+        "ubicacion": data.get("ubicacion", ""),
+        "estado_civil": data.get("estado_civil", "Soltero"),
+        "observaciones": data.get("observaciones", ""),
     }
 
     query_col, stat_col = st.columns([0.7, 0.3])
@@ -887,6 +1075,7 @@ def main() -> None:
     with stat_col:
         st.metric("Avance del expediente", f"{ratio:.0%}", f"{complete} de {total}")
 
+    render_client_file(expediente, tipo, complete, total, ratio)
     render_sidebar(tipo, sections, rows, expediente, enabled_optional)
     render_pending_summary(rows)
     render_checklist(tipo, sections, query or "", expediente)
