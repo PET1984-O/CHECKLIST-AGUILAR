@@ -701,7 +701,7 @@ def render_print_button() -> None:
             padding:0.55rem 0.8rem;
             font:600 0.95rem sans-serif;
             cursor:pointer;">
-            Imprimir checklist
+            Imprimir
         </button>
         """,
         height=48,
