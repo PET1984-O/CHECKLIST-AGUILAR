@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 import csv
 import hashlib
+import html
 import json
 import re
 
@@ -586,50 +587,6 @@ def collect_rows(tipo: str, sections: List[Section], expediente: Dict[str, str])
     return rows
 
 
-def make_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
-    lines = [
-        "CHECKLIST AGUILAR 2025",
-        f"Folio: {expediente['folio']}",
-        f"Fecha: {expediente['fecha']}",
-        f"Tipo de crédito: {rows[0]['tipo_credito'] if rows else ''}",
-        f"Cliente: {expediente['cliente']}",
-        f"Estado civil: {expediente.get('estado_civil', '')}",
-        f"Teléfono: {expediente['telefono']}",
-        f"Asesor: {expediente['asesor']}",
-        f"Desarrollo: {expediente['desarrollo']}",
-        f"Calle: {expediente['calle']}",
-        f"Ubicación: {expediente['ubicacion']}",
-        "",
-    ]
-    current_section = None
-    for row in rows:
-        if row["seccion"] != current_section:
-            current_section = row["seccion"]
-            lines.extend(["", f"--- {current_section.upper()} ---"])
-        mark = "X" if row["estado"] == "Recibido" else " "
-        comment = f" | Comentario: {row['comentario']}" if row["comentario"] else ""
-        files = f" | Archivos: {row['archivos']}" if row.get("archivos") else ""
-        lines.append(f"[{mark}] {row['requisito']}{comment}{files}")
-    lines.extend(
-        [
-            "",
-            "Observaciones generales:",
-            expediente["observaciones"] or "Sin observaciones.",
-            "",
-            "Nota: Documento digital de control interno para Ventas y Titulación.",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def make_csv(rows: List[Dict[str, str]]) -> str:
-    output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()) if rows else [])
-    writer.writeheader()
-    writer.writerows(rows)
-    return output.getvalue()
-
-
 def selected_pending_rows(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> List[Dict[str, str]]:
     return [
         row
@@ -639,29 +596,168 @@ def selected_pending_rows(rows: List[Dict[str, str]], expediente: Dict[str, str]
     ]
 
 
-def make_pending_txt(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> str:
-    pending = selected_pending_rows(rows, expediente)
+def export_rows_for_client(rows: List[Dict[str, str]], expediente: Dict[str, str]) -> List[Dict[str, str]]:
+    selected = selected_pending_rows(rows, expediente)
+    if selected:
+        return selected
+
+    return [
+        {
+            "seccion": "Sin seleccion",
+            "requisito": "No hay requisitos seleccionados para enviar al cliente.",
+            "estado": "",
+            "comentario": "",
+            "archivos": "",
+        }
+    ]
+
+
+def document_lines(rows: List[Dict[str, str]], expediente: Dict[str, str], title: str) -> List[str]:
     lines = [
-        "REQUISITOS FALTANTES PARA CLIENTE - CHECKLIST AGUILAR 2025",
+        title,
         f"Folio: {expediente['folio']}",
+        f"Fecha: {expediente['fecha']}",
+        f"Tipo de credito: {rows[0].get('tipo_credito', '') if rows else ''}",
         f"Cliente: {expediente['cliente']}",
         f"Estado civil: {expediente.get('estado_civil', '')}",
-        f"Fecha: {expediente['fecha']}",
+        f"Telefono: {expediente['telefono']}",
+        f"Asesor: {expediente['asesor']}",
+        f"Desarrollo: {expediente['desarrollo']}",
+        f"Calle: {expediente['calle']}",
+        f"Ubicacion: {expediente['ubicacion']}",
         "",
     ]
-    if not pending:
-        lines.append("No hay requisitos seleccionados para enviar al cliente.")
-        return "\n".join(lines)
-
     current_section = None
-    for row in pending:
+    for row in rows:
         if row["seccion"] != current_section:
             current_section = row["seccion"]
-            lines.extend(["", f"--- {current_section.upper()} ---"])
-        comment = f" | Comentario: {row['comentario']}" if row["comentario"] else ""
+            lines.extend(["", current_section.upper()])
+        status = f"[{row.get('estado', '')}] " if row.get("estado") else ""
+        comment = f" | Comentario: {row['comentario']}" if row.get("comentario") else ""
         files = f" | Archivos: {row['archivos']}" if row.get("archivos") else ""
-        lines.append(f"- {row['requisito']}{comment}{files}")
-    return "\n".join(lines)
+        lines.append(f"{status}{row['requisito']}{comment}{files}")
+    lines.extend(["", "Observaciones generales:", expediente["observaciones"] or "Sin observaciones."])
+    return lines
+
+
+def make_xls(rows: List[Dict[str, str]], expediente: Dict[str, str], title: str) -> bytes:
+    headers = ["Seccion", "Requisito", "Estado", "Comentario", "Archivos"]
+    meta = [
+        ("Folio", expediente["folio"]),
+        ("Fecha", expediente["fecha"]),
+        ("Tipo de credito", rows[0].get("tipo_credito", "") if rows else ""),
+        ("Cliente", expediente["cliente"]),
+        ("Estado civil", expediente.get("estado_civil", "")),
+        ("Telefono", expediente["telefono"]),
+        ("Asesor", expediente["asesor"]),
+        ("Desarrollo", expediente["desarrollo"]),
+        ("Calle", expediente["calle"]),
+        ("Ubicacion", expediente["ubicacion"]),
+    ]
+    parts = [
+        "<html><head><meta charset='utf-8'></head><body>",
+        f"<h2>{html.escape(title)}</h2>",
+        "<table border='1'>",
+    ]
+    for label, value in meta:
+        parts.append(f"<tr><th>{html.escape(label)}</th><td colspan='4'>{html.escape(str(value))}</td></tr>")
+    parts.append("<tr></tr>")
+    parts.append("<tr>" + "".join(f"<th>{html.escape(header)}</th>" for header in headers) + "</tr>")
+    for row in rows:
+        parts.append(
+            "<tr>"
+            f"<td>{html.escape(row.get('seccion', ''))}</td>"
+            f"<td>{html.escape(row.get('requisito', ''))}</td>"
+            f"<td>{html.escape(row.get('estado', ''))}</td>"
+            f"<td>{html.escape(row.get('comentario', ''))}</td>"
+            f"<td>{html.escape(row.get('archivos', ''))}</td>"
+            "</tr>"
+        )
+    parts.append("</table></body></html>")
+    return "\n".join(parts).encode("utf-8")
+
+
+def pdf_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def wrap_pdf_line(text: str, width: int = 96) -> List[str]:
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+def make_pdf(rows: List[Dict[str, str]], expediente: Dict[str, str], title: str) -> bytes:
+    raw_lines = document_lines(rows, expediente, title)
+    wrapped_lines: List[str] = []
+    for line in raw_lines:
+        wrapped_lines.extend(wrap_pdf_line(line))
+
+    pages = []
+    line_height = 13
+    lines_per_page = 52
+    for start in range(0, len(wrapped_lines), lines_per_page):
+        chunk = wrapped_lines[start:start + lines_per_page]
+        commands = ["BT", "/F1 9 Tf", "50 750 Td"]
+        for index, line in enumerate(chunk):
+            if index:
+                commands.append(f"0 -{line_height} Td")
+            commands.append(f"({pdf_escape(line)}) Tj")
+        commands.append("ET")
+        pages.append("\n".join(commands).encode("latin-1", errors="replace"))
+
+    objects: List[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    page_object_ids = []
+    content_object_ids = []
+    for stream in pages:
+        content_id = len(objects) + 1
+        content_object_ids.append(content_id)
+        objects.append(b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream")
+        page_id = len(objects) + 1
+        page_object_ids.append(page_id)
+        page = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+        ).encode("ascii")
+        objects.append(page)
+
+    kids = " ".join(f"{page_id} 0 R" for page_id in page_object_ids)
+    objects[1] = f"<< /Type /Pages /Count {len(page_object_ids)} /Kids [{kids}] >>".encode("ascii")
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{index} 0 obj\n".encode("ascii"))
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode("ascii")
+    )
+    return bytes(pdf)
 
 
 def make_progress_json(
@@ -1081,31 +1177,32 @@ def render_sidebar(
     filename_base = f"Checklist_{clean_filename(tipo)}_{clean_filename(expediente['cliente'])}"
     st.sidebar.header("Exportar")
     st.sidebar.download_button(
-        "Descargar TXT",
-        data=make_txt(rows, expediente),
-        file_name=f"{filename_base}.txt",
-        mime="text/plain",
+        "Checklist XLS",
+        data=make_xls(rows, expediente, "CHECKLIST AGUILAR 2025"),
+        file_name=f"{filename_base}.xls",
+        mime="application/vnd.ms-excel",
         use_container_width=True,
     )
     st.sidebar.download_button(
-        "Descargar CSV",
-        data=make_csv(rows),
-        file_name=f"{filename_base}.csv",
-        mime="text/csv",
+        "Checklist PDF",
+        data=make_pdf(rows, expediente, "CHECKLIST AGUILAR 2025"),
+        file_name=f"{filename_base}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+    client_rows = export_rows_for_client(rows, expediente)
+    st.sidebar.download_button(
+        "Faltantes cliente XLS",
+        data=make_xls(client_rows, expediente, "REQUISITOS FALTANTES PARA CLIENTE"),
+        file_name=f"{filename_base}_faltantes_cliente.xls",
+        mime="application/vnd.ms-excel",
         use_container_width=True,
     )
     st.sidebar.download_button(
-        "Guardar avance (.json)",
-        data=make_progress_json(tipo, sections, expediente, enabled_optional),
-        file_name=f"{filename_base}_avance.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-    st.sidebar.download_button(
-        "Descargar faltantes cliente (.txt)",
-        data=make_pending_txt(rows, expediente),
-        file_name=f"{filename_base}_faltantes.txt",
-        mime="text/plain",
+        "Faltantes cliente PDF",
+        data=make_pdf(client_rows, expediente, "REQUISITOS FALTANTES PARA CLIENTE"),
+        file_name=f"{filename_base}_faltantes_cliente.pdf",
+        mime="application/pdf",
         use_container_width=True,
     )
 
@@ -1168,13 +1265,24 @@ def render_pending_summary(rows: List[Dict[str, str]], expediente: Dict[str, str
                 )
 
         filename_base = f"Faltantes_cliente_{clean_filename(expediente['cliente'])}"
-        st.download_button(
-            "Descargar listado seleccionado para cliente (.txt)",
-            data=make_pending_txt(rows, expediente),
-            file_name=f"{filename_base}.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+        export_rows = export_rows_for_client(rows, expediente)
+        download_col_1, download_col_2 = st.columns(2)
+        with download_col_1:
+            st.download_button(
+                "Descargar XLS",
+                data=make_xls(export_rows, expediente, "REQUISITOS FALTANTES PARA CLIENTE"),
+                file_name=f"{filename_base}.xls",
+                mime="application/vnd.ms-excel",
+                use_container_width=True,
+            )
+        with download_col_2:
+            st.download_button(
+                "Descargar PDF",
+                data=make_pdf(export_rows, expediente, "REQUISITOS FALTANTES PARA CLIENTE"),
+                file_name=f"{filename_base}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
 
 
 def render_checklist(tipo: str, sections: List[Section], query: str, expediente: Dict[str, str]) -> None:
