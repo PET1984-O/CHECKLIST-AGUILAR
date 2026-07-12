@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from io import StringIO
+from pathlib import Path
 from typing import Dict, Iterable, List
 import csv
 import hashlib
@@ -16,6 +17,9 @@ try:
     from pdf_assets import ORIGINAL_CHECKLIST_PDFS
 except ImportError:
     ORIGINAL_CHECKLIST_PDFS = {}
+
+
+AUTOSAVE_DIR = Path("autosaves")
 
 
 st.set_page_config(
@@ -695,6 +699,66 @@ def make_progress_json(
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def autosave_path(folio: str) -> Path:
+    return AUTOSAVE_DIR / f"{clean_filename(folio)}.json"
+
+
+def save_progress_automatically(
+    tipo: str,
+    sections: List[Section],
+    expediente: Dict[str, str],
+    enabled_optional: Iterable[str],
+) -> tuple[bool, str]:
+    folio = expediente.get("folio", "").strip()
+    if not folio or folio == "SIN-FOLIO":
+        return False, "Sin folio para autoguardar."
+
+    try:
+        AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = json.loads(make_progress_json(tipo, sections, expediente, enabled_optional))
+        payload["autosaved_at"] = datetime.now().isoformat(timespec="seconds")
+        autosave_path(folio).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, payload["autosaved_at"]
+    except OSError as exc:
+        return False, f"No se pudo autoguardar: {exc}"
+
+
+def load_autosave(folio: str) -> Dict[str, object] | None:
+    path = autosave_path(folio)
+    if not path.exists():
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def list_autosaves() -> List[Dict[str, str]]:
+    if not AUTOSAVE_DIR.exists():
+        return []
+
+    saved = []
+    for path in sorted(AUTOSAVE_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        expediente = payload.get("expediente", {})
+        if not isinstance(expediente, dict):
+            continue
+        saved.append(
+            {
+                "folio": str(expediente.get("folio") or path.stem),
+                "cliente": str(expediente.get("cliente") or "Cliente sin nombre"),
+                "tipo": str(payload.get("tipo_credito") or ""),
+                "fecha": str(payload.get("autosaved_at") or ""),
+            }
+        )
+    return saved
+
+
 def restore_progress(payload: Dict[str, object], tipo: str, expediente: Dict[str, str]) -> tuple[bool, str]:
     saved_tipo = str(payload.get("tipo_credito", ""))
     if saved_tipo and saved_tipo != tipo:
@@ -741,10 +805,14 @@ def render_header() -> None:
     st.caption("Control digital de expedientes para Ventas y Titulación")
 
 
+def new_folio() -> str:
+    return f"AG-{datetime.now():%Y%m%d-%H%M%S}"
+
+
 def default_client_data() -> Dict[str, str]:
     return {
         "tipo_credito": "Infonavit Tradicional y Total",
-        "folio": f"AG-{date.today():%Y%m%d}",
+        "folio": new_folio(),
         "fecha": date.today().isoformat(),
         "cliente": "",
         "telefono": "",
@@ -850,7 +918,7 @@ def render_start_page() -> None:
             cliente = st.text_input("Nombre del cliente", value=data.get("cliente", ""))
             asesor = st.text_input("Asesor", value=data.get("asesor", ""))
         with c2:
-            folio = st.text_input("Folio interno", value=data.get("folio", f"AG-{date.today():%Y%m%d}"))
+            folio = st.text_input("Folio interno", value=data.get("folio", new_folio()))
             desarrollo = st.text_input("Desarrollo / fraccionamiento", value=data.get("desarrollo", ""))
             calle = st.text_input("Calle y número", value=data.get("calle", ""))
         with c3:
@@ -877,9 +945,18 @@ def render_start_page() -> None:
                 st.warning("Capture el desarrollo.")
                 return
 
+            folio_final = folio.strip() or new_folio()
+            autosaved = load_autosave(folio_final)
+            if autosaved is not None:
+                restored, message = restore_saved_client(autosaved)
+                if restored:
+                    st.success(f"{message} Se abrió el autoguardado del folio {folio_final}.")
+                    st.rerun()
+                st.warning(message)
+
             st.session_state["client_data"] = {
                 "tipo_credito": tipo,
-                "folio": folio or f"AG-{date.today():%Y%m%d}",
+                "folio": folio_final,
                 "fecha": fecha,
                 "cliente": cliente,
                 "telefono": telefono,
@@ -907,6 +984,31 @@ def render_start_page() -> None:
                     st.warning(message)
             except (json.JSONDecodeError, UnicodeDecodeError):
                 st.error("No pude leer ese archivo de avance.")
+
+    with st.container(border=True):
+        st.subheader("Recuperar avance automático")
+        recover_col, button_col = st.columns([0.7, 0.3])
+        with recover_col:
+            folio_to_load = st.text_input("Folio autoguardado", placeholder="Ej. AG-20260712-153000")
+        with button_col:
+            st.write("")
+            st.write("")
+            if st.button("Abrir folio", use_container_width=True):
+                payload = load_autosave(folio_to_load.strip())
+                if payload is None:
+                    st.warning("No encontré un avance automático con ese folio.")
+                else:
+                    restored, message = restore_saved_client(payload)
+                    if restored:
+                        st.success(message)
+                        st.rerun()
+                    st.warning(message)
+
+        saved = list_autosaves()[:5]
+        if saved:
+            st.caption("Últimos autoguardados")
+            for item in saved:
+                st.markdown(f"- **{item['folio']}** · {item['cliente']} · {item['tipo']} · {item['fecha']}")
 
     render_original_checklist_downloads()
 
@@ -964,12 +1066,17 @@ def render_sidebar(
     rows: List[Dict[str, str]],
     expediente: Dict[str, str],
     enabled_optional: Iterable[str],
+    autosave_status: tuple[bool, str],
 ) -> None:
     complete, total, ratio = progress(rows)
     st.sidebar.header("Resumen")
     st.sidebar.metric("Avance", f"{complete}/{total}", f"{ratio:.0%}")
     st.sidebar.progress(ratio)
     st.sidebar.caption(SOURCE_NOTES.get(tipo, "Basado en formatos internos 2025"))
+    if autosave_status[0]:
+        st.sidebar.success(f"Autoguardado: {autosave_status[1]}")
+    else:
+        st.sidebar.warning(autosave_status[1])
 
     filename_base = f"Checklist_{clean_filename(tipo)}_{clean_filename(expediente['cliente'])}"
     st.sidebar.header("Exportar")
@@ -1133,11 +1240,12 @@ def main() -> None:
         query = st.text_input("Buscar requisito", placeholder="Buscar por documento, formato o anexo")
     rows = collect_rows(tipo, sections, expediente)
     complete, total, ratio = progress(rows)
+    autosave_status = save_progress_automatically(tipo, sections, expediente, enabled_optional)
     with stat_col:
         st.metric("Avance del expediente", f"{ratio:.0%}", f"{complete} de {total}")
 
     render_client_file(expediente, tipo, complete, total, ratio)
-    render_sidebar(tipo, sections, rows, expediente, enabled_optional)
+    render_sidebar(tipo, sections, rows, expediente, enabled_optional, autosave_status)
     render_checklist(tipo, sections, query or "", expediente)
     render_pending_summary(rows, expediente)
 
